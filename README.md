@@ -110,6 +110,43 @@ To repair a chain that has already fallen behind, run `--mode backfill` once fro
 (`--start-height`), then switch to `--mode live`. Multiple operators can run this at the same time:
 submitting a transaction someone else already relayed is a no-op.
 
+### Surviving a restart
+
+Three things can be lost when a machine goes down. Only one of them used to matter.
+
+**The bridge's own state** (`state.sqlite`) is WAL with `synchronous=NORMAL`: a crash cannot
+corrupt it, and a power cut can lose the last few commits. That costs a re-walk of those Bitcoin
+blocks and nothing else — everything already submitted comes back `present`, and the cursor only
+advances on a completed block. If you would rather pay for the last commits, set
+`PRAGMA synchronous=FULL` (one line in `State.__init__`); it is not the default because the failure
+it prevents is re-work, not loss.
+
+**The eCash node's mempool** is the one that matters. `mempool.dat` is written on a clean shutdown
+only, so a power cut, an OOM kill or a `kill -9` loses every replayed transaction that has not yet
+been mined — and with it every later Bitcoin transaction spending one of those outputs. The bridge
+handles this itself: it reconciles the whole injected set against `getrawmempool` at startup, and
+again whenever the node's `uptime` goes backwards, re-queueing what is genuinely gone. On a healthy
+restart that is one RPC (betanet, 41,204 injected and unconfirmed: *"41204 still in the ECX mempool,
+0 to account for"*, about a second). No operator action is needed, and nothing has to be re-walked.
+
+If you would rather not lose the mempool in the first place, a timer bounds it:
+
+```bash
+*/10 * * * * ecash-cli savemempool >/dev/null 2>&1
+```
+
+Two node settings are worth checking while you are there: `maxmempool` (the bridge paces itself
+against `mempool_fraction` of it, so a small one throttles replay), and `mempoolexpiry` (default
+336 h — a replayed transaction that waits longer than this is dropped by the node, and the bridge
+puts it back as `evicted`).
+
+**The Bitcoin node's mempool** is not the bridge's business: it only ever reads blocks.
+
+Whatever restarts the bridge should start it after both nodes, and restart it on failure —
+`Restart=always` in the unit above, or an `@reboot` line guarded by a "already running?" check.
+Starting it twice is safe (submitting a transaction someone else already relayed is a no-op), but
+it wastes RPC.
+
 ### At a fork
 
 Start it *before* the fork height is reached, in `--mode live`. It idles until the first post-fork
@@ -318,7 +355,18 @@ the 220 repurpose transactions' inputs. `policy` counts the first class so its s
 `tests/test_scenarios.py` starts a vanilla Core 29 regtest node and an eCash alphanet-binary
 regtest node (same genesis, `-listen=0 -connect=0`), feeds both to height 201 with a fan-out
 transaction, imports the same wallet descriptors into both, forks them (ECX mines ahead, as on
-the real networks), and drives each scenario through the BTC side:
+the real networks), and drives each scenario through the BTC side.
+
+It needs both binaries; point it at them and run the lot, or name scenarios:
+
+```bash
+export GARP_VANILLA_BIN=/path/to/bitcoin-29/bin      # dir holding bitcoind + bitcoin-cli
+export GARP_ECX_BIN=/path/to/ecash/bin               # the eCash build under test
+export GARP_REGTEST_ROOT=/tmp/garp-regtest           # datadirs (wiped per scenario)
+python3 tests/test_scenarios.py                      # all of them, ~7 min
+python3 tests/test_scenarios.py T2 T25               # just these
+```
+
 
 | | scenario | asserts |
 |---|---|---|
