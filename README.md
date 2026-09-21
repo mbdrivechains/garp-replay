@@ -31,6 +31,94 @@ destroyed, and can re-walk the chain from the fork to repair damage already done
 
 ---
 
+## Quick start
+
+You need two nodes on the same machine and Python ≥ 3.11. Nothing else.
+
+**1. A Bitcoin node.** Any Core 29+, pruned is fine (blocks are read over RPC, no `txindex`
+needed). In `bitcoin.conf`:
+
+```
+server=1
+rpcuser=user
+rpcpassword=CHANGEME
+```
+
+**2. An eCash node**, synced and on the network, with a transaction index. In `ecash.conf`:
+
+```
+server=1
+txindex=1
+rpcuser=user
+rpcpassword=CHANGEME
+```
+
+**3. Configure the bridge.** `cp garp_replay.example.toml garp_replay.toml`, then set the two RPC
+URLs and the network:
+
+```toml
+network = "mainnet"          # or betanet / alphanet / regtest
+[btc]
+rpc_url = "http://user:CHANGEME@127.0.0.1:8332"
+[ecx]
+rpc_url = "http://user:CHANGEME@127.0.0.1:8532"
+[state]
+path = "/var/lib/garp-replay/state.sqlite"
+```
+
+**4. Dry run first** — this submits nothing, it only reports what it would do:
+
+```bash
+python3 garp_replay.py --config garp_replay.toml --mode live
+```
+
+You should see one line per Bitcoin block: how many of its transactions are already on eCash, how
+many would be injected, how many are dead. If it refuses to start it will say why (node syncing,
+`txindex` behind, chains disagreeing) — fix that first.
+
+**5. Go live.** `--live-send` is the only thing that makes it submit, and it cannot be set from the
+config file:
+
+```bash
+python3 garp_replay.py --config garp_replay.toml --mode live --live-send
+```
+
+**6. Keep it running.** A user systemd unit is enough:
+
+```ini
+[Unit]
+Description=garp-replay BTC->ECX replay bridge
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/garp-replay/garp_replay.py --config /etc/garp-replay.toml --mode live --live-send
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+### Is it working?
+
+The per-block log line is the answer. `present` is how many of that Bitcoin block's transactions
+reached eCash by any other route before the bridge got there; `injected` is how many the bridge
+placed. On a chain where nothing else is feeding replay, `present` is near zero and `injected` is
+most of the block. `status.json` carries the same counters plus the queue depth.
+
+To repair a chain that has already fallen behind, run `--mode backfill` once from the fork height
+(`--start-height`), then switch to `--mode live`. Multiple operators can run this at the same time:
+submitting a transaction someone else already relayed is a no-op.
+
+### At a fork
+
+Start it *before* the fork height is reached, in `--mode live`. It idles until the first post-fork
+Bitcoin block exists, then keeps eCash current from that block onward, so no gap ever forms. A gap
+of even a few blocks compounds: on betanet, ~13 hours of dropped transactions took more than a day
+to repair.
+
+---
+
 ## What it does
 
 For each BTC block from the fork height (or the saved cursor) to the tip, in block order:
