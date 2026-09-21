@@ -440,6 +440,9 @@ class State:
     def pending_count(self):
         return self.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
 
+    def pending_all(self):
+        return self.db.execute("SELECT txid, height, idx FROM pending ORDER BY height, idx").fetchall()
+
     # blocks
     def block_add(self, row):
         cols = ",".join(row)
@@ -659,9 +662,13 @@ class Bridge:
             try:
                 if not started:
                     self.startup_checks()
-                    self.follow_ecx()
+                    self.follow_ecx()          # retire whatever was mined while we were down
+                    self.note_ecx_uptime()     # baseline, so the first pass is not read as a restart
+                    self.reconcile_pending("startup")
                     self.write_status()
                     started = True
+                else:
+                    self.check_ecx_restart()
                 if revalidate:  # after an outage: the ECX node may be back in IBD, reindexing or rolled back
                     self.wait_for_nodes()
                     revalidate = False
@@ -1216,6 +1223,71 @@ class Bridge:
             raise
         if lost:
             log.info("pending verifier: %d lost from the ECX mempool re-queued", requeued)
+
+    def reconcile_pending(self, why):
+        """Settle the whole injected set against what the ECX node actually holds.
+
+        `mempool.dat` is only written on a clean shutdown, so a power cut, an OOM kill or a crash loses
+        every injected transaction that had not yet been mined -- and with it every later transaction
+        that spends one. The age-gated verifier finds those eventually, but it ignores anything younger
+        than verify_after_secs and looks at verify_batch rows per ECX block, which is hours. This reads
+        the mempool once and checks only what is not in it, so the table is settled in one pass."""
+        if self.dry_run:
+            return 0
+        total = self.state.pending_count()
+        if not total:
+            return 0
+        mem = set(self.ecx.call("getrawmempool"))
+        absent = [r for r in self.state.pending_all() if r[0] not in mem]
+        log.info("reconcile (%s): %d injected and unconfirmed, %d still in the ECX mempool, %d to account for",
+                 why, total, total - len(absent), len(absent))
+        if not absent:
+            return 0
+        chunk = max(1, int(self.cfg["limits"]["verify_batch"]))
+        requeued = confirmed_n = 0
+        for i in range(0, len(absent), chunk):
+            if self.stop:
+                break
+            rows = absent[i:i + chunk]
+            # not in the mempool: txindex says whether it was mined or is simply gone
+            res = self.ecx.batch([("getrawtransaction", [txid, 0]) for txid, _, _ in rows])
+            lost, confirmed = [], []
+            for row, (r, err) in zip(rows, res):
+                if err and err.get("code") != -5:
+                    raise RPCError("getrawtransaction", err.get("code"), err.get("message"))
+                (confirmed if r else lost).append(row)
+            self.state.begin()
+            try:
+                if confirmed:
+                    self.state.pending_remove_many([r[0] for r in confirmed])
+                if lost:
+                    requeued += self.requeue_from_btc(lost)
+                self.state.commit()
+            except BaseException:
+                self.state.rollback()
+                raise
+            confirmed_n += len(confirmed)
+        log.info("reconcile (%s): %d already mined on ECX, %d lost and re-queued", why, confirmed_n, requeued)
+        if requeued:
+            self.write_status()
+        return requeued
+
+    def note_ecx_uptime(self):
+        up, err = self.ecx.try_call("uptime")
+        if err or up is None:
+            return None
+        self.state.set("ecx_uptime", str(int(up)))
+        return int(up)
+
+    def check_ecx_restart(self):
+        """`uptime` going backwards means the node restarted, which means its mempool is whatever survived
+        -- nothing at all after an unclean stop. Reconcile then, rather than waiting for the verifier."""
+        prev = self.state.get("ecx_uptime")
+        up = self.note_ecx_uptime()
+        if up is None or prev is None or up >= int(prev):
+            return
+        log.warning("the ECX node restarted (uptime %ds, was %ss); reconciling the injected set", up, prev)
+        self.reconcile_pending("ecx restart")
 
     # ---- pacing ------------------------------------------------------------------------------
     def pace(self):

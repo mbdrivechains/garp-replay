@@ -11,6 +11,7 @@ garp_replay.py as a subprocess against the pair. Datadirs live under .regtest/<s
 """
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -606,7 +607,9 @@ def t16_evicted_parent(port):
             assert b.status_json()["retry_queue"] == 0
         finally:
             out = stop_live(proc, b)
-        assert "re-queueing it" in out, out[-2000:]
+        # either trigger is a pass: the startup/uptime reconciliation (T25) usually gets there first,
+        # the pending-record rule catches a parent dropped without a restart (eviction, expiry)
+        assert "re-queueing it" in out or "reconciling the injected set" in out, out[-2000:]
         return "ECX mempool loss: P re-queued (evicted), C1 child-of-retry, sweep delivered P+C1, C2 injected; bridge survived the restart"
     finally:
         pair.stop()
@@ -890,13 +893,63 @@ def t24_units(port):
     return "batch error object -> RPCError; IncompleteRead retried; sweep PRESENT dequeued + pending"
 
 
+def t25_mempool_wiped(port):
+    """T25: the ECX node dies without writing mempool.dat (power cut / OOM kill) and comes back empty.
+    Everything injected and not yet mined is gone; the bridge must notice and put it back -- both when
+    it is running at the time (uptime went backwards) and when it is started afterwards."""
+    pair = Pair("t25", ecx_extra=["-persistmempool=0", "-walletbroadcast=0"], portbase=port).start().setup()
+    try:
+        coins = pair.coins(max_amount=1)
+        first = plain_txs(pair, 6, coins[:6])
+        pair.van.mine(1)
+        b = Bridge(pair, "wipe", extra=["--btc-poll-secs", "2", "--retry-interval-secs", "5",
+                                        "--verify-after-secs", "100000"])   # the age-gated verifier must not help
+        proc = b.start(mode="live")
+        try:
+            wait_for(lambda: set(first) <= pair.ecx.mempool(), proc, what="first injection")
+            assert b.status_json()["pending"] == 6, b.status_json()["pending"]
+
+            # --- A: killed and restarted underneath a running bridge ---------------------------
+            proc.send_signal(signal.SIGSTOP)            # hold the bridge so the wipe is observable
+            pair.ecx.restart()      # -persistmempool=0: it comes back with nothing, as after a power cut
+            assert pair.ecx.mempool() == set(), "the wipe did not happen"
+            proc.send_signal(signal.SIGCONT)
+            wait_for(lambda: set(first) <= pair.ecx.mempool(), proc, secs=120, what="re-injection after the wipe")
+            a_msg = "running bridge restored 6"
+        finally:
+            out = stop_live(proc, b)
+        assert "reconciling the injected set" in out, out[-2000:]
+
+        # --- B: killed while the bridge is down, found at startup ------------------------------
+        second = plain_txs(pair, 4, coins[6:10])
+        pair.van.mine(1)
+        proc = b.start(mode="live")
+        try:
+            wait_for(lambda: set(second) <= pair.ecx.mempool(), proc, what="second injection")
+        finally:
+            stop_live(proc, b)
+        pair.ecx.restart()
+        assert pair.ecx.mempool() == set()
+        proc = b.start(mode="live")
+        try:
+            wait_for(lambda: set(first) | set(second) <= pair.ecx.mempool(), proc, secs=120,
+                     what="re-injection at startup")
+        finally:
+            out = stop_live(proc, b)
+        assert "reconcile (startup)" in out, out[-2000:]
+        assert b.status_json()["pending"] == 10, b.status_json()["pending"]
+        return a_msg + "; a restarted bridge restored all 10 at startup"
+    finally:
+        pair.stop()
+
+
 SCENARIOS = [
     ("T1", t01_plain), ("T2", t02_cluster), ("T3", t03_coinbase), ("T5", t05_rbf), ("T8", t08_csv),
     ("T10", t10_crash_and_concurrency), ("T12", t12_dry_run), ("T13", t13_confirmed_file),
     ("T6", t06_reorg), ("T7", t07_package), ("T14", t14_simulate), ("T15", t15_live_mode),
     ("T16", t16_evicted_parent), ("T17", t17_no_give_up_on_transient), ("T18", t18_ecx_node_checks),
     ("T19", t19_cpfp_dry_run), ("T20", t20_pacing_calls), ("T21", t21_btc_tip_below_cursor),
-    ("T22", t22_ecx_reorg_walk_bounded), ("T23", t23_replacement_failed), ("T24", t24_units),
+    ("T22", t22_ecx_reorg_walk_bounded), ("T23", t23_replacement_failed), ("T24", t24_units), ("T25", t25_mempool_wiped),
 ]
 
 

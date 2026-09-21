@@ -10,7 +10,7 @@ Status: **running in production on eCash betanet since 2026-09-20**, where it is
 only source of replayed Bitcoin transactions: of ~41,650 transactions in betanet's mempool, 41,632
 were placed by this tool, and new Bitcoin blocks arrive with 0–92 of their ~3,500 transactions
 already present. Over 970,000 transactions restored so far. Validated before that on a regtest pair
-(vanilla Core 29 + the eCash betanet binary) with the 21 scenarios in `tests/`.
+(vanilla Core 29 + the eCash betanet binary) with the 22 scenarios in `tests/`.
 
 ## Why it exists
 
@@ -139,6 +139,15 @@ restart without `persistmempool`). The same record decides the fate of a child w
 missing on ECX: a parent with a `pending` row was *dropped* and is re-queued from its BTC block on
 the spot (child → `retry:child-of-retry`); a parent with no record at all was never accepted by ECX
 and the child is `dead:ancestor`. Absence alone is never cached as dead.
+
+A node that comes back having lost its mempool *entirely* is a different size of problem:
+`mempool.dat` is only written on a clean shutdown, so a power cut, an OOM kill or a crash drops
+everything injected and not yet mined, and with it every later transaction spending one of those
+outputs. Working through that with the age gate and one batch per ECX block would take hours. So
+the whole `pending` table is reconciled against `getrawmempool` in a single pass — at startup, and
+again whenever ECX's `uptime` goes backwards — with a batched presence check of only the rows the
+mempool no longer holds. What was mined is retired; what is genuinely gone is re-queued from its
+Bitcoin block.
 
 ### Classifier (exact strings of Core v31 / `ecash-com/alphanet`, all verified on regtest)
 
@@ -334,6 +343,7 @@ the real networks), and drives each scenario through the BTC side:
 | T22 | 1-block ECX reorg under a live bridge; ECX block between backfill runs | ≤ 8 headers walked, 0 full blocks while nothing is pending; `ecx_tip` persisted |
 | T23 | v31 feerate-diagram RBF loss (`replacement-failed`) | `conflict:rbf-loss`, never re-submitted |
 | T24 | unit stubs (no nodes) | batch error object → `RPCError`; `IncompleteRead` retried; sweep `PRESENT` dequeues |
+| T25 | ECX loses its whole mempool (no `persistmempool`), under a live bridge and while it is down | restart detected via `uptime`; the injected set reconciled in one pass and re-injected in both cases |
 
 ```bash
 python3 tests/test_scenarios.py          # all (~6 min, 20 node pairs sequentially)
