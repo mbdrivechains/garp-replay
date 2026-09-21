@@ -1,0 +1,45 @@
+# garp_replay configuration. Most keys can be overridden on the command line
+# (--btc-url, --state, --mode, ...). Sending is NEVER enabled from this file:
+# the process runs as a dry run until --live-send is passed on the command line.
+
+network = "betanet"          # alphanet | betanet | mainnet | regtest
+                             # fork height preset: 963648 | 967680 | 973728 | (--fork-height)
+# fork_height = 967680       # override the preset if needed
+
+[btc]                        # the vanilla Bitcoin Core node (no txindex needed; pruned is fine)
+rpc_url  = "http://127.0.0.1:8332"
+cookie   = "/home/user/.bitcoin/.cookie"      # or user = "..." / password = "..."
+
+[ecx]                        # the eCash node: txindex=1 is required (presence checks)
+rpc_url  = "http://127.0.0.1:18303"
+user     = "user"
+password = "password"
+require_txindex = true
+
+[run]
+mode = "live"                # backfill: cursor -> BTC tip, then exit; live: keep following
+# start_height = 967680      # first block when no cursor exists (default: fork height)
+confirmations_required = 1   # 2 = lag one BTC block (avoids re-walks on 1-block reorgs)
+max_attempts = 500           # drop a policy-rejected entry after this many sweeps (transient kinds are never given up)
+
+[pacing]
+mempool_fraction = 0.85      # pause while ECX mempool usage > fraction x maxmempool
+pace_poll_secs = 60
+retry_interval_secs = 600    # sweep the retry queue at least this often (also after every ECX block)
+verify_after_secs = 21600    # re-check injected-but-unconfirmed txs after 6 h; re-queue if evicted
+btc_poll_secs = 30           # waitfornewblock timeout
+submit_delay_ms = 0          # random 0..N ms before each submit (only useful for a fleet of instances)
+
+[limits]
+dead_cache_entries = 2000000 # in-memory cap (~150 MB in Python); txindex is the ground truth
+presence_batch = 100         # JSON-RPC batch size for presence checks (<= 100)
+
+[state]
+path = "/var/lib/garp_replay/state.sqlite"
+
+[report]
+status_file = "/var/lib/garp_replay/status.json"
+confirmed_file = "/var/lib/garp_replay/btc_confirmed.txt"   # omit to disable the export
+confirmed_window = 288       # BTC blocks covered by confirmed_file (~2 days)
+log_level = "info"
+rolling_blocks = 144
