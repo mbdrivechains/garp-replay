@@ -283,7 +283,6 @@ REJECT_TABLE = {
     "package-not-child-with-unconfirmed-parents": (RETRY, "package-shape"),
     # the parent alone is unacceptable; needs its child (CPFP / ephemeral dust) -> submitpackage
     "min relay fee not met": (PACKAGE, "minrelay"),
-    "dust": (PACKAGE, "dust"),
     "missing-ephemeral-spends": (PACKAGE, "ephemeral"),
     "invalid-ephemeral-fee": (PACKAGE, "ephemeral"),
     # lost to a variant ECX already holds or mined: count, never fight
@@ -291,6 +290,9 @@ REJECT_TABLE = {
     "replacement-failed": (CONFLICT, "rbf-loss"),   # v31 cluster mempool: does not improve the feerate diagram
     "txn-mempool-conflict": (CONFLICT, "mempool-conflict"),
     "bad-txns-spends-conflicting-tx": (CONFLICT, "mempool-conflict"),
+    # judged on the transaction alone, so no package or later block changes it: more than one dust output,
+    # or ephemeral dust on a transaction that pays a fee (a zero-fee dust parent fails "min relay fee" first)
+    "dust": (POLICY, "dust"),
 }
 
 
@@ -544,6 +546,7 @@ class BlockStats:
 
 class Bridge:
     MAXBURN = 21_000_000  # sendrawtransaction maxburnamount: never refuse a BTC-confirmed tx for burning
+    ECX_START_SLACK = 5   # seconds: two start times derived from `uptime` differ by rounding (2s) plus reply latency
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -663,7 +666,7 @@ class Bridge:
                 if not started:
                     self.startup_checks()
                     self.follow_ecx()          # retire whatever was mined while we were down
-                    self.note_ecx_uptime()     # baseline, so the first pass is not read as a restart
+                    self.note_ecx_start()      # baseline, so the first pass is not read as a restart
                     self.reconcile_pending("startup")
                     self.write_status()
                     started = True
@@ -1272,21 +1275,35 @@ class Bridge:
             self.write_status()
         return requeued
 
-    def note_ecx_uptime(self):
+    def note_ecx_start(self):
+        """Record the ECX node's `uptime` and the start time it implies (clock - uptime). Returns
+        (started, uptime), or None if the node cannot be asked."""
         up, err = self.ecx.try_call("uptime")
         if err or up is None:
             return None
-        self.state.set("ecx_uptime", str(int(up)))
-        return int(up)
+        up = int(up)
+        started = int(time.time()) - up
+        self.state.set("ecx_uptime", str(up))
+        self.state.set("ecx_started", str(started))
+        return started, up
 
     def check_ecx_restart(self):
-        """`uptime` going backwards means the node restarted, which means its mempool is whatever survived
-        -- nothing at all after an unclean stop. Reconcile then, rather than waiting for the verifier."""
-        prev = self.state.get("ecx_uptime")
-        up = self.note_ecx_uptime()
-        if up is None or prev is None or up >= int(prev):
+        """A restarted node has a mempool that is whatever survived -- nothing at all after an unclean stop.
+        Reconcile then, rather than waiting for the verifier. `uptime` going backwards shows a restart only if
+        we ask before the new node has been up as long as the old one was; a later start time shows it
+        whenever we ask."""
+        prev_started, prev_up = self.state.get("ecx_started"), self.state.get("ecx_uptime")
+        now = self.note_ecx_start()
+        if now is None:
             return
-        log.warning("the ECX node restarted (uptime %ds, was %ss); reconciling the injected set", up, prev)
+        started, up = now
+        if prev_up is not None and up < int(prev_up):
+            why = "uptime %ds, was %ss" % (up, prev_up)
+        elif prev_started is not None and started > int(prev_started) + self.ECX_START_SLACK:
+            why = "started %ds after the start we knew" % (started - int(prev_started))
+        else:
+            return
+        log.warning("the ECX node restarted (%s); reconciling the injected set", why)
         self.reconcile_pending("ecx restart")
 
     # ---- pacing ------------------------------------------------------------------------------

@@ -838,11 +838,16 @@ def t23_replacement_failed(port):
 
 def t24_units(port):
     """T24 (review minors, no nodes): batch-level error object -> RPCError; IncompleteRead is retried; a sweep
-    submit that comes back PRESENT dequeues the row and tracks it as pending."""
+    submit that comes back PRESENT dequeues the row and tracks it as pending. `dust` is a policy reject (no
+    package or later block clears it); a zero-fee dust parent's own reject still routes to a package."""
     import http.client
     import tempfile
     import garp_replay as g
     from regtest_lib import ROOT
+    assert g.classify_reject("dust") == (g.POLICY, "dust")
+    assert g.classify_reject("dust, tx with dust output must be 0-fee") == (g.POLICY, "dust")
+    assert g.classify_reject("min relay fee not met, 0 < 110") == (g.PACKAGE, "minrelay")
+    assert g.classify_reject("missing-ephemeral-spends") == (g.PACKAGE, "ephemeral")
     os.makedirs(ROOT, exist_ok=True)
     root = tempfile.mkdtemp(prefix="t24-", dir=ROOT)
     rpc = g.RPC("x", "http://127.0.0.1:1/")
@@ -896,7 +901,9 @@ def t24_units(port):
 def t25_mempool_wiped(port):
     """T25: the ECX node dies without writing mempool.dat (power cut / OOM kill) and comes back empty.
     Everything injected and not yet mined is gone; the bridge must notice and put it back -- both when
-    it is running at the time (uptime went backwards) and when it is started afterwards."""
+    it is running at the time and when it is started afterwards. The running bridge is held until the new
+    node has been up longer than the old one was, so `uptime` alone never goes backwards: only the start
+    time shows the restart."""
     pair = Pair("t25", ecx_extra=["-persistmempool=0", "-walletbroadcast=0"], portbase=port).start().setup()
     try:
         coins = pair.coins(max_amount=1)
@@ -910,9 +917,14 @@ def t25_mempool_wiped(port):
             assert b.status_json()["pending"] == 6, b.status_json()["pending"]
 
             # --- A: killed and restarted underneath a running bridge ---------------------------
+            while pair.ecx.rpc("uptime") < 20:          # a node that has been up a while, as a real one has
+                time.sleep(1)
             proc.send_signal(signal.SIGSTOP)            # hold the bridge so the wipe is observable
+            was_up = pair.ecx.rpc("uptime")             # at least what the bridge last saw
             pair.ecx.restart()      # -persistmempool=0: it comes back with nothing, as after a power cut
             assert pair.ecx.mempool() == set(), "the wipe did not happen"
+            while pair.ecx.rpc("uptime") <= was_up + 2:  # uptime is now past the old value: not "backwards"
+                time.sleep(1)
             proc.send_signal(signal.SIGCONT)
             wait_for(lambda: set(first) <= pair.ecx.mempool(), proc, secs=120, what="re-injection after the wipe")
             a_msg = "running bridge restored 6"

@@ -125,7 +125,7 @@ it prevents is re-work, not loss.
 only, so a power cut, an OOM kill or a `kill -9` loses every replayed transaction that has not yet
 been mined — and with it every later Bitcoin transaction spending one of those outputs. The bridge
 handles this itself: it reconciles the whole injected set against `getrawmempool` at startup, and
-again whenever the node's `uptime` goes backwards, re-queueing what is genuinely gone. On a healthy
+again whenever the node has restarted (its `uptime` went backwards, or the start time it implies moved on), re-queueing what is genuinely gone. On a healthy
 restart that is one RPC (betanet, 41,204 injected and unconfirmed: *"41204 still in the ECX mempool,
 0 to account for"*, about a second). No operator action is needed, and nothing has to be re-walked.
 
@@ -194,9 +194,9 @@ Bitcoin block.
 | `txn-already-in-mempool`, `txn-same-nonwitness-data-in-mempool`, `txn-already-known`, `Transaction outputs already in utxo set` | `present` | no-op |
 | `missing-inputs` / `bad-txns-inputs-missingorspent` | resolved per input: parent present on ECX but outpoint gone → **`conflict:split`**; parent absent and known dead, or absent with no `pending` record → **`dead:ancestor`**; parent absent but in `pending` (dropped by ECX) → parent re-queued as `retry:evicted`, child `retry:child-of-retry`; parent in the retry queue → `retry:child-of-retry` | |
 | `non-final`, `non-BIP68-final`, `TRUC-violation`, `too-large-cluster`, `too-long-mempool-chain`, `mempool full`, `mempool min fee not met`, `bad-txns-premature-spend-of-coinbase`, `too many potential replacements`, `replacement-adds-unconfirmed` | `retry:<tag>` | transient on a slower chain; queued |
-| `min relay fee not met`, `dust`, `missing-ephemeral-spends` | `package:<tag>` | the parent cannot stand alone; when its child arrives, `submitpackage([parents…, child])` |
+| `min relay fee not met`, `missing-ephemeral-spends` | `package:<tag>` | the parent cannot stand alone; when its child arrives, `submitpackage([parents…, child])` |
 | `insufficient fee`, `replacement-failed` (RBF loses to an ECX mempool variant, incl. v31's feerate-diagram check), `txn-mempool-conflict` | `conflict:<tag>` | counted, never fought |
-| anything else | `policy:<tag>` | recorded; re-offered until `max_attempts`, then dropped (only policy rejects are ever given up; transient kinds wait for ECX blockspace indefinitely) |
+| `dust` (more than one dust output, or dust on a transaction that pays a fee), and anything else | `policy:<tag>` | recorded; re-offered until `max_attempts`, then dropped (only policy rejects are ever given up; transient kinds wait for ECX blockspace indefinitely) |
 
 `txn-mempool-conflict`, `too-long-mempool-chain`, `missing-ephemeral-spends` and
 `package-not-child-with-unconfirmed-parents` do not occur in the v31 tree; they are kept as
@@ -220,7 +220,7 @@ as dead without txindex. This is why the ECX node needs `txindex=1`.
 `testmempoolaccept` judges every package member on its own fee (the test path runs with
 `package_feerates=false`, verified on ECX v31 and vanilla 29), so a zero-fee parent + CPFP child can
 *never* pass a dry-run package test although `submitpackage` accepts it live. Both dry modes
-therefore fall back to an **estimate** when the parent alone is rejected for `min relay fee` / `dust`:
+therefore fall back to an **estimate** when the parent alone is rejected for `min relay fee`:
 if the package feerate computed from the BTC node's `getblock … 2` fee data clears ECX's
 `minrelaytxfee`, the package is counted as injected (`status.json: package_estimated` says how many).
 The child's scripts are not evaluated in that case — the same caveat as any descendant of a would-be
@@ -390,8 +390,8 @@ python3 tests/test_scenarios.py T2 T25               # just these
 | T21 | BTC tip below the cursor (invalidated tip) | waits, cursor kept; reorg handled once a replacement block exists |
 | T22 | 1-block ECX reorg under a live bridge; ECX block between backfill runs | ≤ 8 headers walked, 0 full blocks while nothing is pending; `ecx_tip` persisted |
 | T23 | v31 feerate-diagram RBF loss (`replacement-failed`) | `conflict:rbf-loss`, never re-submitted |
-| T24 | unit stubs (no nodes) | batch error object → `RPCError`; `IncompleteRead` retried; sweep `PRESENT` dequeues |
-| T25 | ECX loses its whole mempool (no `persistmempool`), under a live bridge and while it is down | restart detected via `uptime`; the injected set reconciled in one pass and re-injected in both cases |
+| T24 | unit stubs (no nodes) | batch error object → `RPCError`; `IncompleteRead` retried; sweep `PRESENT` dequeues; `dust` is `policy`, not `package` |
+| T25 | ECX loses its whole mempool (no `persistmempool`), under a live bridge and while it is down | restart detected by the node's start time, even with the bridge held until the new `uptime` passes the old; the injected set reconciled in one pass and re-injected in both cases |
 
 ```bash
 python3 tests/test_scenarios.py          # all (~6 min, 20 node pairs sequentially)
