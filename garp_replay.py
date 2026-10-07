@@ -8,6 +8,9 @@ consensus). Whatever ECX refuses for a transient reason (relative/absolute locks
 elapsed on the slower chain, cluster limits, a full mempool, TRUC ordering) goes into a durable
 retry queue and is offered again after every ECX block. Whatever is provably dead (spends a
 post-fork BTC coinbase, or an output ECX already spent differently) is counted and never fought.
+So is a zero-fee transaction whose fee payer is dead ("unpaid"): ECX policy lets a transaction with
+an anchor (dust) output in only together with the child that spends the anchor, and on BTC that
+child was the dead fee payer.
 
 Safety properties:
   * dry-run by default: nothing is submitted unless --live-send is given;
@@ -36,7 +39,7 @@ import tomllib
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 log = logging.getLogger("garp_replay")
 
 # --------------------------------------------------------------------------------------------
@@ -310,6 +313,20 @@ def classify_reject(message):
     return POLICY, tag
 
 
+DUST_RELAY_FEE = 3000  # sat/kvB: Core's DUST_RELAY_TX_FEE (ECX runs the default)
+
+
+def is_dust(sats, spk_hex):
+    """Core's IsDust() at the default dust relay fee (policy/policy.cpp, GetDustThreshold)."""
+    spk = bytes.fromhex(spk_hex)
+    n = len(spk)
+    if (n and spk[0] == 0x6a) or n > 10_000:  # provably unspendable: never dust
+        return False
+    witness = 4 <= n <= 42 and (spk[0] == 0 or 0x51 <= spk[0] <= 0x60) and spk[1] + 2 == n
+    size = 8 + (1 if n < 253 else 3 if n <= 0xFFFF else 5) + n + 32 + 4 + 1 + (107 // 4 if witness else 107) + 4
+    return sats < size * DUST_RELAY_FEE // 1000
+
+
 # --------------------------------------------------------------------------------------------
 # Persistent state (sqlite)
 # --------------------------------------------------------------------------------------------
@@ -408,6 +425,18 @@ class State:
         r = self.db.execute("SELECT height, idx, parents FROM retry WHERE txid=?", (txid,)).fetchone()
         return {"height": r[0], "idx": r[1], "parents": json.loads(r[2])} if r else None
 
+    def retry_row(self, txid):
+        r = self.db.execute("SELECT hex, height, kind, tag, fee FROM retry WHERE txid=?", (txid,)).fetchone()
+        return {"txid": txid, "hex": r[0], "height": r[1], "kind": r[2], "tag": r[3], "fee": r[4]} if r else None
+
+    def retry_children(self):
+        """parent txid -> [queued txids that spend it]"""
+        kids = collections.defaultdict(list)
+        for txid, parents in self.db.execute("SELECT txid, parents FROM retry"):
+            for p in {p for p, _ in json.loads(parents)}:
+                kids[p].append(txid)
+        return kids
+
     def retry_kinds(self):
         return {r[0]: r[1] for r in self.db.execute("SELECT txid, kind FROM retry")}
 
@@ -449,6 +478,20 @@ class State:
     def block_add(self, row):
         cols = ",".join(row)
         self.db.execute(f"INSERT OR REPLACE INTO blocks({cols}) VALUES({','.join('?' * len(row))})", tuple(row.values()))
+
+    def block_reclass(self, height, col, old_key, new_key):
+        """Count one transaction of block `height` as dead (tag `new_key`) instead of `col` (tag `old_key`)."""
+        r = self.db.execute("SELECT tags FROM blocks WHERE height=?", (height,)).fetchone()
+        if r is None:
+            return
+        tags = json.loads(r[0] or "{}")
+        if tags.get(old_key, 0) > 0:
+            tags[old_key] -= 1
+            if not tags[old_key]:
+                del tags[old_key]
+        tags[new_key] = tags.get(new_key, 0) + 1
+        self.db.execute(f"UPDATE blocks SET {col}=MAX({col}-1, 0), dead=dead+1, dead_ancestor=dead_ancestor+?, tags=?"
+                        " WHERE height=?", (int(new_key == "dead:ancestor"), json.dumps(tags, sort_keys=True), height))
 
     def block_rows(self, limit):
         cur = self.db.execute("SELECT * FROM blocks ORDER BY height DESC LIMIT ?", (limit,))
@@ -576,7 +619,10 @@ class Bridge:
         self.pace_at = 0                                 # self.submits at the last pacing check
         self._blk_cache = None                           # (height, block): last BTC block re-read for a re-queue
         self.stop = False
+        self._stats = None                               # BlockStats of the block being processed
+        self._dust = {}                                  # queued txid -> its dust output indexes (zero-fee only)
         self.crash_after = int(os.environ.get("GARP_CRASH_AFTER_SUBMITS", "0") or 0)  # test hook
+        self.unpaid_rule = os.environ.get("GARP_NO_UNPAID_RULE") != "1"                # test hook: the 0.1.1 behaviour
 
     # ---- startup ---------------------------------------------------------------------------
     def startup_checks(self):
@@ -668,6 +714,7 @@ class Bridge:
                     self.follow_ecx()          # retire whatever was mined while we were down
                     self.note_ecx_start()      # baseline, so the first pass is not read as a restart
                     self.reconcile_pending("startup")
+                    self.scan_unpaid()
                     self.write_status()
                     started = True
                 else:
@@ -783,6 +830,7 @@ class Bridge:
         self.pace()
         rpc0, ecx0 = self.btc.total_calls + self.ecx.total_calls, self.ecx.total_calls
         self.state.begin()
+        self._stats = stats
         try:
             ctx = _BlockContext(self, txs)
             for tx in txs:
@@ -798,6 +846,8 @@ class Bridge:
         except BaseException:
             self.state.rollback()
             raise
+        finally:
+            self._stats = None
         if self.cfg["report"]["confirmed_file"]:
             self.window[height] = (bh, [t.txid for t in txs])
             self.write_confirmed_file()
@@ -809,10 +859,10 @@ class Bridge:
         # 1. dead-cache: a known-dead ancestor makes this tx dead, no RPC
         for ptx, _ in tx.vin:
             if ptx in self.coinbases:
-                self.dead.add(tx.txid)
+                self.mark_dead(tx)
                 return DEAD, "coinbase"
             if ptx in self.dead:
-                self.dead.add(tx.txid)
+                self.mark_dead(tx)
                 return DEAD, "ancestor"
         # 2. retry-set: a parent still waiting means this one waits too (or completes a package)
         waiting = [ptx for ptx, _ in tx.vin if ptx in self.retry_kinds]
@@ -849,15 +899,13 @@ class Bridge:
                 else:
                     self.queue(tx, height, RETRY, tag, reason)
             else:
-                self.dequeue(tx.txid)
-                self.dead.add(tx.txid)
+                self.mark_dead(tx)
             return cls, tag
         if cls in (RETRY, PACKAGE):
             self.queue(tx, height, cls, tag, reason)
             return cls, tag
         if cls == CONFLICT:
-            self.dequeue(tx.txid)
-            self.dead.add(tx.txid)
+            self.mark_dead(tx)
             log.info("conflict %s at %d: %s", tx.txid, height, reason)
             return CONFLICT, tag
         # POLICY: recorded, retried rarely (max_attempts), then dropped
@@ -876,7 +924,14 @@ class Bridge:
     def child_of_waiting(self, tx, height, waiting):
         """tx spends a parent that is in the retry queue. If every waiting parent is a
         package-kind parent (unacceptable alone), try a child-with-parents package now;
-        otherwise queue the child behind its parent (0 RPC)."""
+        otherwise queue the child behind its parent (0 RPC). A fee payer (it spends a queued zero-fee parent's
+        dust) is judged first: if it is dead, its parent can never clear, so waiting for the parent would hide
+        that forever."""
+        if self.unpaid_rule and self.pays_for_dust(tx):
+            c, t = self.resolve_missing(tx)
+            if c in (DEAD, CONFLICT):
+                self.mark_dead(tx)
+                return c, t
         kinds = {self.retry_kinds[p] for p in waiting}
         reason = None
         if kinds == {PACKAGE}:
@@ -889,6 +944,9 @@ class Bridge:
                     self.dequeue(p)
                 cls, tag, reason = self.submit_one(tx)
                 return self.apply_result(tx, height, cls, tag, reason)
+            dead = self.package_missing(tx, cls)
+            if dead:
+                return dead
         self.queue(tx, height, RETRY, "child-of-retry", reason)
         return RETRY, "child-of-retry"
 
@@ -1007,9 +1065,141 @@ class Bridge:
         self.retry_kinds[tx.txid] = kind
 
     def dequeue(self, txid):
+        self._dust.pop(txid, None)
         if txid in self.retry_kinds:
             self.state.retry_remove(txid)
             del self.retry_kinds[txid]
+
+    # ---- dead, and the unpaid parents of the dead ------------------------------------------
+    def mark_dead(self, tx):
+        """tx can never be in ECX's chain: out of the queue, into the dead-cache, and any zero-fee parent it
+        paid for is settled too."""
+        self.dequeue(tx.txid)
+        self.dead.add(tx.txid)
+        if self.unpaid_rule:
+            self.strand_unpaid(tx)
+
+    def package_missing(self, tx, cls, row=None):
+        """A child-with-parents package failed. If ECX reported missing inputs, an input other than the queued
+        parents may be dead (a dead-cache miss, e.g. after a restart): judge the inputs as for a lone
+        missing-inputs reject. -> (DEAD | CONFLICT, tag) when the child can never get in, else None."""
+        if cls != MISSING:
+            return None
+        c, t = self.resolve_missing(tx)
+        if c not in (DEAD, CONFLICT):
+            return None
+        if row is not None:  # queued since an earlier block: count it as dead there
+            self.reclass(row, t)
+        self.mark_dead(tx)
+        return c, t
+
+    def strand_unpaid(self, tx):
+        """ECX policy admits a transaction with a dust output (an anchor) only at zero fee, even after
+        prioritisetransaction, and only together with a child that spends the dust. On BTC that child was its
+        fee payer. When the fee payer `tx` is dead, nothing the bridge holds can carry the parent: the parent is
+        unpaid, so dead for replay, and so is everything queued behind it. The parent may be queued under any
+        kind (package:minrelay on its own, retry:child-of-retry behind another queued parent). (Anyone can still
+        attach a new fee payer on ECX by hand: an anchor is spendable by anyone.)"""
+        for ptx in self.pays_for_dust(tx):
+            if ptx in self.retry_kinds:
+                k = self.drop_unpaid(ptx)
+                log.info("unpaid %s: its fee payer %s cannot be on ECX; %d queued txs now dead", ptx, tx.txid, k)
+
+    def pays_for_dust(self, tx):
+        """The queued zero-fee transactions whose dust output `tx` spends: `tx` is their fee payer."""
+        return sorted({p for p, n in tx.vin if p in self.retry_kinds and n in self.dust_of(p)})
+
+    def dust_of(self, txid):
+        """Dust output indexes of queued `txid`; empty when it pays a fee (dust must be zero-fee anyway)."""
+        if txid not in self._dust:
+            row = self.state.retry_row(txid)
+            if row is None:
+                return frozenset()
+            self._dust[txid] = frozenset(self.dust_outputs(row["hex"])) if not row["fee"] else frozenset()
+        return self._dust[txid]
+
+    def drop_unpaid(self, txid, kids=None):
+        """The unpaid parent `txid` (dead:unpaid) and everything queued behind it (dead:ancestor) leave the
+        queue and count as dead in their own blocks. -> how many."""
+        kids = self.state.retry_children() if kids is None else kids
+        todo, n = [(txid, "unpaid")], 0
+        while todo:
+            t, tag = todo.pop()
+            row = self.state.retry_row(t) if t in self.retry_kinds else None
+            if row is None:
+                continue
+            self.reclass(row, tag)
+            self.dequeue(t)
+            self.dead.add(t)
+            n += 1
+            todo.extend((k, "ancestor") for k in kids.get(t, ()))
+        return n
+
+    def reclass(self, row, tag):
+        """Count queued transaction `row` as dead:<tag> in its block instead of under its queue class."""
+        if row["tag"] == "evicted":  # counted as injected/present in its block; that stays history
+            return
+        cls = row["kind"] if row["kind"] in (PACKAGE, POLICY) else RETRY
+        old = f"{cls}:{row['tag']}"
+        s = self._stats
+        if s is not None and s.height == row["height"]:
+            if s.counts[cls] > 0:
+                s.counts[cls] -= 1
+            if s.tags[old] > 0:
+                s.tags[old] -= 1
+                if not s.tags[old]:
+                    del s.tags[old]
+            s.add(DEAD, tag)
+        else:
+            self.state.block_reclass(row["height"], cls, old, f"{DEAD}:{tag}")
+
+    def dust_outputs(self, hex_):
+        d = self.btc.call("decoderawtransaction", hex_)
+        return {o["n"] for o in d["vout"] if is_dust(round(o["value"] * 1e8), o["scriptPubKey"]["hex"])}
+
+    def scan_unpaid(self):
+        """Once per state file: apply the unpaid rule to what was queued before the rule existed (0.1.1). A
+        queued zero-fee transaction is unpaid when the transaction that spent its dust output in the same BTC
+        block is neither queued, nor tracked in `pending`, nor on ECX: blocks are walked in order, so it was
+        offered and found dead (or given up)."""
+        if not self.unpaid_rule or self.state.get("unpaid_scan") == "1":
+            return
+        rows = [r for r in self.state.retry_rows() if not r["fee"]]
+        kids = self.state.retry_children()
+        roots = n = 0
+        spenders = (None, {})
+        self.state.begin()
+        try:
+            for r in rows:
+                if r["txid"] not in self.retry_kinds:  # already dropped behind another unpaid parent
+                    continue
+                dust = self.dust_of(r["txid"])
+                if not dust:
+                    continue
+                if spenders[0] != r["height"]:
+                    _, blk = self.fetch_block(r["height"])
+                    spenders = (r["height"], {(v["txid"], v["vout"]): t["txid"] for t in blk["tx"] for v in t["vin"]
+                                              if "txid" in v})
+                for i in sorted(dust):
+                    s = spenders[1].get((r["txid"], i))
+                    if s and s not in self.retry_kinds and self.state.pending_get(s) is None and not self.on_ecx(s):
+                        n += self.drop_unpaid(r["txid"], kids)
+                        roots += 1
+                        break
+            self.state.set("unpaid_scan", "1")
+            self.state.commit()
+        except BaseException:
+            self.state.rollback()
+            self.retry_kinds = self.state.retry_kinds()
+            raise
+        log.info("unpaid scan: %d zero-fee parents whose fee payer cannot be on ECX; %d queued txs now dead",
+                 roots, n)
+
+    def on_ecx(self, txid):
+        r, err = self.ecx.try_call("getrawtransaction", txid, 1)
+        if err and err.get("code") != -5:
+            raise RPCError("getrawtransaction", err.get("code"), err.get("message"))
+        return r is not None
 
     # ---- ECX submission --------------------------------------------------------------------
     def submit_one(self, tx):
@@ -1058,6 +1248,9 @@ class Bridge:
             bad = [(i, r) for i, r in enumerate(res) if not r.get("allowed")]
             if not bad:
                 return ACCEPTED, "package", None
+            missing = self.child_missing(child, [(r.get("txid"), r.get("reject-reason")) for _, r in bad])
+            if missing:
+                return missing
             i, r = bad[0]
             reason = r.get("reject-details") or r.get("reject-reason") or "package rejected"
             cls, tag = classify_reject(r.get("reject-reason") or reason)
@@ -1085,11 +1278,23 @@ class Bridge:
             return cls, tag, err.get("message")
         if res.get("package_msg") == "success":
             return ACCEPTED, "package", None
-        for r in res.get("tx-results", {}).values():
-            if r.get("error"):
-                cls, tag = classify_reject(r["error"])
-                return cls, tag, r["error"]
+        errors = [(r.get("txid"), r["error"]) for r in res.get("tx-results", {}).values() if r.get("error")]
+        missing = self.child_missing(child, errors)
+        if missing:
+            return missing
+        for _, e in errors:
+            cls, tag = classify_reject(e)
+            return cls, tag, e
         return POLICY, "package", res.get("package_msg")
+
+    @staticmethod
+    def child_missing(child, errors):
+        """The child's own missing-inputs verdict outranks a parent's fee complaint: no fee arrangement can
+        supply an input ECX does not have (the caller resolves which). errors: [(txid, reject string)]."""
+        for txid, e in errors:
+            if txid == child.txid and e and classify_reject(e)[0] == MISSING:
+                return MISSING, "missing", e
+        return None
 
     # ---- retry sweep ---------------------------------------------------------------------------
     def sweep(self):
@@ -1105,6 +1310,8 @@ class Bridge:
             for row in rows:
                 if self.stop:
                     break
+                if row["txid"] not in self.retry_kinds:  # left the queue earlier in this sweep (unpaid tree)
+                    continue
                 tx = _RetryTx(row)
                 # Only policy rejects are ever given up (and only dropped, never marked dead: if ECX still
                 # lacks the parent when a child comes along, the child's own missing-inputs resolution says so).
@@ -1116,6 +1323,13 @@ class Bridge:
                     counts["gave-up"] += 1
                     continue
                 waiting = [p for p in tx.parents if p in self.retry_kinds]
+                if waiting and self.unpaid_rule and self.pays_for_dust(tx):  # a fee payer: dead, or still waiting?
+                    c, t = self.resolve_missing(tx)
+                    if c in (DEAD, CONFLICT):
+                        self.reclass(row, t)
+                        self.mark_dead(tx)
+                        counts[c] += 1
+                        continue
                 if waiting:
                     kinds = {self.retry_kinds[p] for p in waiting}
                     if kinds != {PACKAGE}:
@@ -1125,6 +1339,10 @@ class Bridge:
                     if cls == ACCEPTED:
                         self.package_accepted(waiting, tx, row["height"])
                         counts["injected"] += 1
+                        continue
+                    dead = self.package_missing(tx, cls, row)
+                    if dead:
+                        counts[dead[0]] += 1
                         continue
                     self.state.retry_touch(tx.txid, RETRY, "child-of-retry", reason)
                     counts["waiting"] += 1

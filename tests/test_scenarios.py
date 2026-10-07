@@ -848,6 +848,12 @@ def t24_units(port):
     assert g.classify_reject("dust, tx with dust output must be 0-fee") == (g.POLICY, "dust")
     assert g.classify_reject("min relay fee not met, 0 < 110") == (g.PACKAGE, "minrelay")
     assert g.classify_reject("missing-ephemeral-spends") == (g.PACKAGE, "ephemeral")
+    # Core's dust thresholds at 3 sat/vB: P2A 240, P2TR/P2WSH 330, P2WPKH 294, P2SH 540, P2PKH 546; OP_RETURN never
+    for spk, limit in (("51024e73", 240), ("5120" + "11" * 32, 330), ("0020" + "11" * 32, 330),
+                       ("0014" + "11" * 20, 294), ("a914" + "11" * 20 + "87", 540),
+                       ("76a914" + "11" * 20 + "88ac", 546)):
+        assert g.is_dust(limit - 1, spk) and not g.is_dust(limit, spk), (spk, limit)
+    assert not g.is_dust(0, "6a0401020304")
     os.makedirs(ROOT, exist_ok=True)
     root = tempfile.mkdtemp(prefix="t24-", dir=ROOT)
     rpc = g.RPC("x", "http://127.0.0.1:1/")
@@ -895,7 +901,7 @@ def t24_units(port):
     br.submit_one = lambda tx: (g.PRESENT, "mempool", "txn-already-in-mempool")
     br.sweep()
     assert br.state.retry_count() == 0 and br.state.pending_get(txid) is not None
-    return "batch error object -> RPCError; IncompleteRead retried; sweep PRESENT dequeued + pending"
+    return "batch error object -> RPCError; IncompleteRead retried; sweep PRESENT dequeued + pending; dust thresholds"
 
 
 def t25_mempool_wiped(port):
@@ -955,6 +961,98 @@ def t25_mempool_wiped(port):
         pair.stop()
 
 
+def t26_unpaid(port):
+    """T26 (extra): block X: a zero-fee v3 parent with an anchor, two txs built on it, and its fee payer, which
+    spends a post-fork BTC coinbase (generateblock: BTC miners took them together). The fee payer is dead, so the
+    parent is unpaid: dead:unpaid, both txs behind it dead:ancestor, nothing left queued. Block Y: the same one
+    level down, behind a zero-fee parent whose own fee payer is alive but pays nothing: that parent and its fee
+    payer stay queued; the unpaid child and the tx behind it go. Checked in one run (fee payers caught by the
+    dead-cache), in a fresh process (dead-cache empty: each fee payer judged on arrival), and as the one-time
+    scan over a queue built by the 0.1.1 rules."""
+    pair = Pair("t26", portbase=port).start().setup()
+    try:
+        van = pair.van
+        addr = van.rpc("getnewaddress")
+        cbs = []
+        for blockhash in van.mine(2, addr):
+            cbtx = van.rpc("getblock", blockhash, 2)["tx"][0]
+            cbs.append((cbtx["txid"], float(cbtx["vout"][0]["value"])))
+        (cb, cbval), (cb2, cbval2) = cbs
+        van.mine(100, addr)
+        c_ = Bridge(pair, "c")
+        c_.run()                                     # walks the coinbase block; the next run starts cold
+        anchor = van.rpc("decodescript", "51024e73")["address"]
+        coin = pair.coins(max_amount=1)[0]
+        amt = float(coin["amount"])
+        half = round(amt / 2, 8)
+        T, hT = pair.make_tx([(coin["txid"], coin["vout"], amt)],
+                             {van.rpc("getnewaddress"): half, van.rpc("getnewaddress"): round(amt - half, 8), anchor: 0},
+                             version=3)
+        dT = van.rpc("decoderawtransaction", hT)
+        a_n = next(o["n"] for o in dT["vout"] if o["scriptPubKey"]["hex"] == "51024e73")
+        C, hC = pair.make_tx([(T, 0, half)], {van.rpc("getnewaddress"): half, anchor: 0}, parents={T: hT}, version=3)
+        D, hD = pair.make_tx([(T, 1, round(amt - half, 8))], {van.rpc("getnewaddress"): round(amt - half - 0.0001, 8)},
+                             parents={T: hT})
+        H, hH = pair.make_tx([(T, a_n, 0.0), (cb, 0, cbval)], {van.rpc("getnewaddress"): round(cbval - 0.0001, 8)},
+                             parents={T: hT}, version=3)
+        small = pair.coins(max_amount=1)
+        P, hP, _ = pair.spend_coin(small[1])
+        van.rpc("generateblock", addr, [hT, hC, hD, hH, hP])
+        h = van.height()
+        assert {T, C, D, H, P} <= set(van.rpc("getblock", van.rpc("getblockhash", h))["tx"])
+        # block Y: R zero-fee + anchor; HR pays R's anchor but adds nothing (alive, zero fee); A zero-fee + anchor
+        # behind R; E behind A; HA pays A's anchor with a post-fork coinbase coin (dead)
+        r, x = small[2], small[3]
+        ra, xa = float(r["amount"]), float(x["amount"])
+        R, hR = pair.make_tx([(r["txid"], r["vout"], ra)], {van.rpc("getnewaddress"): ra, anchor: 0}, version=3)
+        HR, hHR = pair.make_tx([(R, 1, 0.0), (x["txid"], x["vout"], xa)], {van.rpc("getnewaddress"): xa},
+                               parents={R: hR}, version=3)
+        A, hA = pair.make_tx([(R, 0, ra)], {van.rpc("getnewaddress"): ra, anchor: 0}, parents={R: hR}, version=3)
+        a_n2 = next(o["n"] for o in van.rpc("decoderawtransaction", hA)["vout"] if o["scriptPubKey"]["hex"] == "51024e73")
+        E, hE = pair.make_tx([(A, 0, ra)], {van.rpc("getnewaddress"): round(ra - 0.0001, 8)}, parents={A: hA})
+        HA, hHA = pair.make_tx([(A, a_n2, 0.0), (cb2, 0, cbval2)], {van.rpc("getnewaddress"): round(cbval2 - 0.0001, 8)},
+                               parents={A: hA}, version=3)
+        assert van.rpc("decoderawtransaction", hR)["vout"][1]["scriptPubKey"]["hex"] == "51024e73"
+        van.rpc("generateblock", addr, [hR, hHR, hA, hE, hHA])
+        hy = van.height()
+
+        def check(b, ancestor, coinbase, what):
+            row = b.block(h)
+            t = tags(row)
+            assert (row["dead"], row["dead_ancestor"], row["dead_coinbase"], row["package"], row["retry"]) == \
+                (4, ancestor, coinbase, 0, 0), (what, row)
+            assert t.get("dead:unpaid") == 1 and row["present"] + row["injected"] == 1, (what, row)
+            y = b.block(hy)
+            assert (y["dead"], y["dead_ancestor"], y["dead_coinbase"], y["package"], y["retry"]) == \
+                (3, ancestor - 1, coinbase, 1, 1), (what, y)
+            assert tags(y).get("dead:unpaid") == 1, (what, y)
+            assert {r[0] for r in b.retry_rows()} == {R, HR}, (what, b.retry_rows())
+
+        c_.run()                                     # cold: H reaches the package path, resolved as dead
+        check(c_, 3, 0, "cold")
+        assert pair.ecx.mempool() == {P}
+        c_.run(extra=["--retry-interval-secs", "0"])   # sweeps leave R and HR waiting, judge nothing new
+        check(c_, 3, 0, "cold, swept")
+        a = Bridge(pair, "a")
+        a.run()                                      # warm: H dead:coinbase straight from the dead-cache
+        check(a, 2, 1, "warm")
+        old = Bridge(pair, "old")
+        old.run(env={"GARP_NO_UNPAID_RULE": "1"})    # the 0.1.1 rules: T package, C and D queued behind it
+        row = old.block(h)
+        assert (row["package"], row["retry"], row["dead"]) == (1, 2, 1), row
+        assert {r[0] for r in old.retry_rows()} == {T, C, D, R, HR, A, E}
+        out = old.run()                              # 0.1.2 start-up: the one-time scan settles them
+        assert "unpaid scan: 2 zero-fee parents" in out and "5 queued txs now dead" in out, out[-1500:]
+        check(old, 2, 1, "scan")
+        again = old.run()
+        assert "unpaid scan" not in again, "the scan runs once per state file"
+        assert pair.ecx.mempool() == {P}
+        return ("unpaid parents (one standalone, one behind a live zero-fee parent) and what is behind them -> dead "
+                "in one run, in a cold run, and by the one-time scan; the live zero-fee parent stays queued")
+    finally:
+        pair.stop()
+
+
 SCENARIOS = [
     ("T1", t01_plain), ("T2", t02_cluster), ("T3", t03_coinbase), ("T5", t05_rbf), ("T8", t08_csv),
     ("T10", t10_crash_and_concurrency), ("T12", t12_dry_run), ("T13", t13_confirmed_file),
@@ -962,6 +1060,7 @@ SCENARIOS = [
     ("T16", t16_evicted_parent), ("T17", t17_no_give_up_on_transient), ("T18", t18_ecx_node_checks),
     ("T19", t19_cpfp_dry_run), ("T20", t20_pacing_calls), ("T21", t21_btc_tip_below_cursor),
     ("T22", t22_ecx_reorg_walk_bounded), ("T23", t23_replacement_failed), ("T24", t24_units), ("T25", t25_mempool_wiped),
+    ("T26", t26_unpaid),
 ]
 
 
@@ -1017,6 +1116,8 @@ def test_t21(): t21_btc_tip_below_cursor(29470)
 def test_t22(): t22_ecx_reorg_walk_bounded(29480)
 def test_t23(): t23_replacement_failed(29490)
 def test_t24(): t24_units(29500)
+def test_t25(): t25_mempool_wiped(29510)
+def test_t26(): t26_unpaid(29520)
 
 
 if __name__ == "__main__":

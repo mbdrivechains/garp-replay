@@ -10,7 +10,7 @@ Status: **running in production on eCash betanet since 2026-09-20**, where it is
 only source of replayed Bitcoin transactions: of ~41,650 transactions in betanet's mempool, 41,632
 were placed by this tool, and new Bitcoin blocks arrive with 0–92 of their ~3,500 transactions
 already present. Over 970,000 transactions restored so far. Validated before that on a regtest pair
-(vanilla Core 29 + the eCash betanet binary) with the 22 scenarios in `tests/`.
+(vanilla Core 29 + the eCash betanet binary) with the 23 scenarios in `tests/`.
 
 ## Why it exists
 
@@ -194,7 +194,7 @@ Bitcoin block.
 | `txn-already-in-mempool`, `txn-same-nonwitness-data-in-mempool`, `txn-already-known`, `Transaction outputs already in utxo set` | `present` | no-op |
 | `missing-inputs` / `bad-txns-inputs-missingorspent` | resolved per input: parent present on ECX but outpoint gone → **`conflict:split`**; parent absent and known dead, or absent with no `pending` record → **`dead:ancestor`**; parent absent but in `pending` (dropped by ECX) → parent re-queued as `retry:evicted`, child `retry:child-of-retry`; parent in the retry queue → `retry:child-of-retry` | |
 | `non-final`, `non-BIP68-final`, `TRUC-violation`, `too-large-cluster`, `too-long-mempool-chain`, `mempool full`, `mempool min fee not met`, `bad-txns-premature-spend-of-coinbase`, `too many potential replacements`, `replacement-adds-unconfirmed` | `retry:<tag>` | transient on a slower chain; queued |
-| `min relay fee not met`, `missing-ephemeral-spends` | `package:<tag>` | the parent cannot stand alone; when its child arrives, `submitpackage([parents…, child])` |
+| `min relay fee not met`, `missing-ephemeral-spends` | `package:<tag>` | the parent cannot stand alone; when its child arrives, `submitpackage([parents…, child])`. If the child that spends the parent's anchor (dust) output is dead, the parent is **`dead:unpaid`** (below) |
 | `insufficient fee`, `replacement-failed` (RBF loses to an ECX mempool variant, incl. v31's feerate-diagram check), `txn-mempool-conflict` | `conflict:<tag>` | counted, never fought |
 | `dust` (more than one dust output, or dust on a transaction that pays a fee), and anything else | `policy:<tag>` | recorded; re-offered until `max_attempts`, then dropped (only policy rejects are ever given up; transient kinds wait for ECX blockspace indefinitely) |
 
@@ -204,6 +204,18 @@ harmless aliases. Every other string has been produced on regtest by the alphane
 JSON-RPC errors that describe the node rather than the transaction (`-28` warming up, `-10`,
 `-20`, protocol errors) are never classified: they are retried at the transport layer and, in
 `--mode live`, waited out (see below).
+
+**Unpaid (0.1.2).** ECX policy, like Core's, admits a transaction with a dust output (an anchor) only at
+zero fee, even after `prioritisetransaction`, and only together with a child that spends the dust. On BTC
+that child is the fee payer. When the fee payer is dead or a conflict (typically: it added a post-fork BTC
+coin to pay the fee), nothing the bridge holds can ever carry the parent. The parent becomes
+`dead:unpaid` and everything queued behind it `dead:ancestor`, each moved to `dead` in its own block's
+counts. A state file written by 0.1.1 gets one start-up pass (`unpaid scan` in the log) that applies the
+same rule to the existing queue: a queued anchor parent whose dust spender in the same BTC block is
+neither queued, nor in `pending`, nor on ECX. On betanet on 2026-10-07 that pass dropped 1,905 queued
+transactions behind 35 such parents, mostly trees of zero-fee v3 transactions. Anyone can still put such
+a parent on ECX by hand with a new fee payer (an anchor is spendable by anyone); the bridge does not. A
+zero-fee parent *without* dust stays `package:minrelay`: a pool can still take it with a fee bump.
 
 `present` is checked **before** submitting on purpose: a long-confirmed ECX transaction whose
 outputs have all been spent comes back as `missing-inputs` from ATMP, and would be misclassified
@@ -347,8 +359,8 @@ missing mass traces to three root classes, and this bridge addresses only the sm
 | **first-sight rejects and relay misses**: `non-BIP68-final`, `TRUC-violation`, cluster limits, mempool full, orphaned children, bridge outages | ~3 % (≈0.2 %/block, compounding) | **Yes** — this is the retry queue's job. |
 
 Also outside its reach: transactions that are non-standard under ECX policy (mined out-of-band
-on BTC), zero-fee transactions with no CPFP child on BTC (`package:minrelay` stays queued), and
-the 220 repurpose transactions' inputs. `policy` counts the first class so its size is known.
+on BTC), zero-fee transactions with no CPFP child on BTC (`package:minrelay` stays queued), zero-fee
+anchor transactions whose fee payer is dead (`dead:unpaid`), and the 220 repurpose transactions' inputs. `policy` counts the first class so its size is known.
 
 ## Tests
 
@@ -392,6 +404,7 @@ python3 tests/test_scenarios.py T2 T25               # just these
 | T23 | v31 feerate-diagram RBF loss (`replacement-failed`) | `conflict:rbf-loss`, never re-submitted |
 | T24 | unit stubs (no nodes) | batch error object → `RPCError`; `IncompleteRead` retried; sweep `PRESENT` dequeues; `dust` is `policy`, not `package` |
 | T25 | ECX loses its whole mempool (no `persistmempool`), under a live bridge and while it is down | restart detected by the node's start time, even with the bridge held until the new `uptime` passes the old; the injected set reconciled in one pass and re-injected in both cases |
+| T26 | zero-fee v3 parent with an anchor, two txs built on it, and its fee payer spending a post-fork coinbase, in one BTC block; the same one level down behind a live zero-fee parent | `dead:unpaid` + `dead:ancestor`, the live parent stays queued: in one run, in a cold run (each fee payer judged on arrival), and by the one-time scan over a queue built with the 0.1.1 rules |
 
 ```bash
 python3 tests/test_scenarios.py          # all (~6 min, 20 node pairs sequentially)
